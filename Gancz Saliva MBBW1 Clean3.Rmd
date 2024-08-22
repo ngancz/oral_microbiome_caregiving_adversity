@@ -1,0 +1,3213 @@
+---
+title: "Gancz Saliva MBBW1 Clean3"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide
+date: "2023-09-01"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+This document shows code used for "Characteristics of the Oral
+Microbiome in Youth Exposed to Caregiving Adversity" by Gancz et al.
+2024.
+
+Abbreviations used throught the document: \* CA: Caregiving Adversity
+
+-   ELA: Early-Life Adversity (used interchangeably with CA)
+
+-   logcort: Log-transformed cortisol (natural log)
+
+-   w1 & w2: Wave 1 and Wave 2 of the study, respectively
+
+-   CBCL: child behavior checklist
+
+-   Pedsql_f: pediatric quality of life scale - fatigue
+
+-   internat: International adoption
+
+-   Tesi: traumatic events screening inventory
+
+-   cg: Caregiver
+
+-   icc: intraclass correlation
+
+# Setup
+
+## Libraries
+
+Load libraries.
+
+```{r,include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(vegan)
+library(car)
+library(readxl)
+library(pscl)
+library(plyr)
+library(lme4)
+library(lmerTest)
+library(kableExtra)
+library(broom)
+library(moderndive)
+library(interactions)
+library(ggpubr)
+library(jtools)
+
+#code to install Maaslin2:
+# 
+# if(!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("Maaslin2")
+library(Maaslin2)
+
+
+#the CLRnorm function here is extracted
+## from the Maaslin2 package source code,
+## and is used for data processing and for
+## making figures
+CLRnorm = function(features) {
+    # Convert to Matrix from Data Frame
+    features_norm = as.matrix(features)
+    dd <- colnames(features_norm)
+    
+    # CLR Normalizing the Data
+    features_CLR <- chemometrics::clr(features_norm + 1)
+    
+    # Convert back to data frame
+    features_CLR <- as.data.frame(features_CLR)
+    
+    # Rename the True Positive Features - Same Format as Before
+    colnames(features_CLR) <- dd
+    
+    
+    # Return
+    return(features_CLR)
+}
+```
+
+## Data Import
+
+### Metadata & Alpha Diversity
+
+Note: MBB071 was reclassified from comparison group to CA group
+following caregiver reports of CA exposure following enrollment in the
+study.
+
+```{r}
+# read in metadata/alpha diversity
+saliva <- read.csv('mbb_w1_saliva_data2.csv')[,-1]
+
+# read in sample storage/incubation info (saliva and hair 
+## files have been
+## edited to reformat dates)
+hair <- read_xlsx("04_11_22_hair_sample_log_edit.xlsx") %>%
+  select(participant_id, date_stored_reformat, temperature) %>%
+  mutate(hair_storage_time = as.numeric(difftime('2022-3-18',date_stored_reformat))) %>%
+  dplyr::rename(hair_storage_temperature = temperature) %>%
+    select(-date_stored_reformat)
+hair$hair_storage_time[which(hair$participant_id=='MBB175')] <- 1 #this sub was processed later
+hair$participant_id[which(hair$participant_id=='MBB103')] <- 'MBB103_2' #changed subject id to match qiime output
+
+
+#read in saliva log
+saliva_log <- read_excel("MBB_sample_storage_log_edit.xlsx") %>%
+  mutate(date_stored_reformat = as.Date(as.numeric(date_stored_reformat),origin="1899-12-30"),
+         date_frozen_reformat = as.Date(as.numeric(date_frozen_reformat),origin="1899-12-30"))%>%
+  select(Participant, Wave,date_stored_reformat,date_frozen_reformat, Saliva) %>%
+  dplyr::rename(saliva_incubated = Saliva) %>%
+  mutate(saliva_storage_time = as.numeric(difftime(date_frozen_reformat,date_stored_reformat, units='days')),
+         saliva_incubated = ifelse(saliva_incubated=='HPL -20', 0, 1)) %>%
+  .[.$Wave==1&!is.na(.$saliva_storage_time),] %>%
+  select(-Wave, -date_stored_reformat, -date_frozen_reformat)
+saliva_log$Participant[which(saliva_log$Participant=='MBB103')] <- 'MBB103_2'
+
+
+# read in other wave 1 data (time since exposure, type of CA,
+## primary/secondary cg education)
+w1_data <- read.csv("../../Wave_1/Data_scoring/Combine_All/MBB_All_Scored_Data_4_30_24.csv") %>% select(c("participant_id",
+                            "ELA_subgroup_str_w1",
+                            "primary_cg_education_w1",
+                            "secondary_cg_education_w1",
+                            "Age.entered.stable.care..years.",
+                            "tesi_lackcare_binary_w1",
+                            "tesi_sexual_binary_w1",
+                            "tesi_physassault_binary_w1"
+                            ))
+w1_data <- distinct(w1_data)
+
+# read in wave 2 oral health questionnaire (oral health conditions and brush/floss score)
+ohq <- read.csv("../../Wave_2/Data_scoring/ohq_parentproxy/ohq_clean_w2_052224.csv") %>% 
+  select(c("participant_id",
+           "oral_hygeine_w2",
+           "brush_w2",
+           "floss_w2",
+           "oral_health_binary_w2"))
+
+# merge loaded data
+saliva <- merge(saliva, saliva_log, by.x='participant_id', by.y='Participant',
+                all.x=TRUE, all.y=FALSE) %>%
+  merge(., hair, by='participant_id', all.x=TRUE) %>%
+  merge(.,w1_data, by='participant_id',all.x=TRUE) %>%
+  merge(.,ohq,by='participant_id',all.x=TRUE)
+
+## New Variables ##
+# time since CA variable
+saliva$time_since_ca <- saliva$child_age_years_w1-saliva$Age.entered.stable.care..years.
+
+# calculate highest caregiver education (whichever education
+## is highest between primary/secondary caregiver)
+saliva$highest_cg_education <- ifelse(saliva$primary_cg_education_w1=='graduate_degree'|
+                                        saliva$secondary_cg_education_w1=='graduate_degree',
+                                      'graduate_degree',
+                                      ifelse(saliva$primary_cg_education_w1=='bachelors_degree'|
+                                               saliva$secondary_cg_education_w1=='bachelors_degree',
+                                             'bachelors_degree',
+                                             ifelse(saliva$primary_cg_education_w1=='some_college'|
+                                                      saliva$secondary_cg_education_w1=='some_college',
+                                                    'some_college',
+                                                    ifelse(saliva$primary_cg_education_w1=='associates degree'|
+                                                             saliva$secondary_cg_education_w1=='associates degree',
+                                                           'associates degree',
+                                                           ifelse(saliva$primary_cg_education_w1=='tech/vocational_school'|saliva$secondary_cg_education_w1=='tech/vocational_school','tech/vocational_school','highschool')))))
+saliva$highest_cg_education <- ifelse(is.na(saliva$secondary_cg_education_w1),saliva$primary_cg_education_w1,
+                                      saliva$highest_cg_education)
+
+# Get CA subgroups
+saliva$ELA_subgroup <- ifelse(saliva$ELA_subgroup_str_w1=='internat_adopt_from_fc'|
+                                saliva$ELA_subgroup_str_w1=='internat_adopt_from_ic',
+                              'internat',
+                              ifelse(saliva$ELA_subgroup_str_w1=='domestic_adopt'|
+                                       saliva$ELA_subgroup_str_w1=='guardianship',
+                                     'domestic',saliva$ELA_subgroup_str_w1))
+saliva$abuse <- ifelse(saliva$tesi_sexual_binary_w1==1|
+                         saliva$tesi_physassault_binary_w1==1,1,0)
+saliva$neglect <- saliva$tesi_lackcare_binary_w1
+saliva$has_sib <- NA
+for (i in c(1:nrow(saliva))) {
+  famid <- saliva$family_id[i]
+  has_sib <- ifelse(
+    sum(saliva$family_id==famid)>1,
+    1,0)
+  saliva$has_sib[i] <- has_sib
+}
+
+# create sequentially coded caregiver education variable
+## (graduate > bachelors > less than bachelors)
+saliva <- transform(saliva,
+                    ed1 = highest_cg_education=='bachelors_degree'|highest_cg_education=='graduate_degree',
+                    ed2 = highest_cg_education=='graduate_degree')
+saliva$highest_cg_education2 <- as.factor(ifelse(saliva$highest_cg_education=='some_college'|
+                                          saliva$highest_cg_education=='tech/vocational_school',
+                                        'less_than_bachelors',saliva$highest_cg_education)) %>%
+   relevel(.,ref='less_than_bachelors')
+```
+
+### Distance Matrices
+Loading data for the distance/dissimilarity matrices, for
+beta diversity analyses.
+
+```{r, message=FALSE, warning=FALSE}
+#Jaccard
+jaccard <- read_tsv("qiime-diversity-results/jaccard_distance_matrix/data/distance-matrix.tsv")
+jaccard <- jaccard[,2:ncol(jaccard)]
+rownames(jaccard) <- colnames(jaccard)
+
+#Bray-Curtis
+bray_curtis <- read_tsv("qiime-diversity-results/bray_curtis_distance_matrix/data/distance-matrix.tsv")
+bray_curtis <- bray_curtis[,2:ncol(bray_curtis)]
+rownames(bray_curtis) <- colnames(bray_curtis)
+
+#Unweighted Unifrac
+unweighted_uf <- read_tsv("qiime-diversity-results/unweighted_unifrac_distance_matrix/data/distance-matrix.tsv")
+unweighted_uf <- unweighted_uf[,2:ncol(unweighted_uf)]
+rownames(unweighted_uf) <- colnames(unweighted_uf)
+
+#Weighted Unifrac
+weighted_uf <- read_tsv("qiime-diversity-results/weighted_unifrac_distance_matrix/data/distance-matrix.tsv")
+weighted_uf <- weighted_uf[,2:ncol(weighted_uf)]
+rownames(weighted_uf) <- colnames(weighted_uf)
+```
+
+### Taxonomy
+Load taxonomy data
+```{r}
+phylum_taxonomy <- as.data.frame(read.csv("phylum-table.tsv.csv"))
+rownames(phylum_taxonomy) <- phylum_taxonomy[,1]
+phylum_taxonomy <- phylum_taxonomy[,2:ncol(phylum_taxonomy)]
+phylum_taxonomy <- t(phylum_taxonomy)
+
+class_taxonomy <- as.data.frame(read.csv("class-table.tsv.csv"))
+rownames(class_taxonomy) <- class_taxonomy[,1]
+class_taxonomy <- class_taxonomy[,2:ncol(class_taxonomy)]
+class_taxonomy <- t(class_taxonomy)
+
+order_taxonomy <- as.data.frame(read.csv("order-table.tsv.csv"))
+rownames(order_taxonomy) <- order_taxonomy[,1]
+order_taxonomy <- order_taxonomy[,2:ncol(order_taxonomy)]
+order_taxonomy <- t(order_taxonomy)
+
+family_taxonomy <- as.data.frame(read.csv("family-table.tsv.csv"))
+rownames(family_taxonomy) <- family_taxonomy[,1]
+family_taxonomy <- family_taxonomy[,2:ncol(family_taxonomy)]
+family_taxonomy <- t(family_taxonomy)
+
+genus_taxonomy <- as.data.frame(read.csv("genus-table.tsv.csv"))
+rownames(genus_taxonomy) <- genus_taxonomy[,1]
+genus_taxonomy <- genus_taxonomy[,2:ncol(genus_taxonomy)]
+genus_taxonomy <- t(genus_taxonomy)
+
+asv_taxonomy <- as.data.frame(read.csv("asv-table.tsv.csv"))
+rownames(asv_taxonomy) <- asv_taxonomy[,1]
+asv_taxonomy <- asv_taxonomy[,2:ncol(asv_taxonomy)]
+asv_taxonomy <- t(asv_taxonomy)
+
+# Create Adversity variable
+saliva$Adversity <- as.factor(ifelse(saliva$ELA_group_w1==0,'Comparison','Caregiving Adversity')) %>%
+  relevel(.,'Comparison')
+
+# Create centered log of cortisol variable
+saliva$logcort_cntr <- scale(saliva$logcort, scale=FALSE, center=TRUE)
+
+# Create data frame for use as Maaslin2 metadata
+saliva_maaslin <- saliva
+rownames(saliva_maaslin) <- saliva$participant_id
+```
+
+## Design Effect (DEFF)
+Calculate design effect
+```{r}
+# Average family size
+family_n_avg <- saliva %>% dplyr::count(family_id)
+family_n_avg <- mean(family_n_avg$n)
+family_n_avg
+```
+
+### Calculate design effect for faith's phylogenetic diversity
+```{r}
+model0_faith_pd <- lmer(formula= faith_pd ~ 1 + (1|family_id),
+                        data=saliva,
+                        na.action=na.exclude)
+summary(model0_faith_pd)
+
+VarCorr(model0_faith_pd)
+
+RandomEffects <- as.data.frame(VarCorr(model0_faith_pd))
+RandomEffects
+
+ICC_between_faith_pd <- RandomEffects[1,4]/(RandomEffects[1,4]+RandomEffects[2,4])
+
+ICC_between_faith_pd
+DEFF_faith_pd <- 1 + (family_n_avg-1)*ICC_between_faith_pd
+DEFF_faith_pd
+DEFT_faith_pd_sqrt <- sqrt(DEFF_faith_pd)
+```
+
+### Calculate design effect for observed features
+```{r}
+model0_observed_features <- lmer(formula= observed_features ~ 1 + (1|family_id),
+                        data=saliva,
+                        na.action=na.exclude)
+summary(model0_observed_features)
+
+VarCorr(model0_observed_features)
+
+RandomEffects <- as.data.frame(VarCorr(model0_observed_features))
+RandomEffects
+
+ICC_between_observed_features <- RandomEffects[1,4]/(RandomEffects[1,4]+RandomEffects[2,4])
+ICC_between_observed_features
+DEFF_observed_features <- 1 + (family_n_avg-1)*ICC_between_observed_features
+DEFF_observed_features
+DEFT_observed_features_sqrt <- sqrt(DEFF_observed_features)
+```
+
+### Calculate design effect for pielou evenness
+```{r}
+model0_pielou_evenness <- lmer(formula= pielou_evenness ~ 1 + (1|family_id),
+                        data=saliva,
+                        na.action=na.exclude)
+summary(model0_pielou_evenness)
+
+VarCorr(model0_pielou_evenness)
+
+RandomEffects <- as.data.frame(VarCorr(model0_pielou_evenness))
+RandomEffects
+
+ICC_between_pielou_evenness <- RandomEffects[1,4]/(RandomEffects[1,4]+RandomEffects[2,4])
+ICC_between_pielou_evenness
+DEFF_pielou_evenness <- 1 + (family_n_avg-1)*ICC_between_pielou_evenness
+DEFF_pielou_evenness
+DEFT_pielou_evenness_sqrt <- sqrt(DEFF_pielou_evenness)
+```
+
+### Calculate design effect for shannon etropy
+```{r}
+model0_shannon_entropy <- lmer(formula= shannon_entropy ~ 1 + (1|family_id),
+                        data=saliva,
+                        na.action=na.exclude)
+summary(model0_shannon_entropy)
+
+VarCorr(model0_shannon_entropy)
+
+RandomEffects <- as.data.frame(VarCorr(model0_shannon_entropy))
+RandomEffects
+
+ICC_between_shannon_entropy <- RandomEffects[1,4]/(RandomEffects[1,4]+RandomEffects[2,4])
+ICC_between_shannon_entropy
+DEFF_shannon_entropy <- 1 + (family_n_avg-1)*ICC_between_shannon_entropy
+DEFF_shannon_entropy
+DEFT_shannon_entropy_sqrt <- sqrt(DEFF_shannon_entropy)
+```
+
+Here is code to adjust by DEFT, if needed
+
+```{r}
+# # calculate adjusted standard errors and p values for main effects and
+# ## interaction effects
+# 
+# # ela
+# ela_se_adj <- summary(observed_features_model)$coefficients[12,2]*DEFT_observed_features
+# ela_p_adj <- pt(-1*abs(summary(observed_features_model)$coefficients[12,1])/ela_se_adj,
+#                 summary(observed_features_model)$df[2])*2
+# ela_se_adj
+# ela_p_adj
+# 
+# # logcort
+# cort_se_adj <- summary(observed_features_model)$coefficients[13,2]*DEFT_observed_features
+# cort_p_adj <- pt(-1*abs(summary(observed_features_model)$coefficients[13,1])/cort_se_adj,
+#                 summary(observed_features_model)$df[2])*2
+# cort_se_adj
+# cort_p_adj
+# 
+# # logcort releveled
+# cort2_se_adj <- summary(observed_features_model2)$coefficients[13,2]*DEFT_observed_features
+# cort2_p_adj <- pt(-1*abs(summary(observed_features_model2)$coefficients[13,1])/cort2_se_adj,
+#                 summary(observed_features_model2)$df[2])*2
+# cort2_se_adj
+# cort2_p_adj
+# 
+# # interaction
+# int_se_adj <- summary(observed_features_model)$coefficients[14,2]*DEFT_observed_features
+# int_p_adj <- pt(-1*abs(summary(observed_features_model)$coefficients[14,1])/int_se_adj,
+#                 summary(observed_features_model)$df[2])*2
+# int_se_adj
+# int_p_adj
+```
+
+# Demographics
+This code is to create tables for demographic variables,
+covariate distributions, etc.
+```{r}
+summarise <- dplyr::summarise
+
+# Race
+saliva$child_race_w1 <- ifelse(saliva$child_race_w1=='Mexican-Palestinian-American'|saliva$child_race_w1=='Mixed','Multiracial',saliva$child_race_w1) #clean up this variable
+
+saliva %>% group_by(ELA_group_w1,child_race_w1) %>%
+  summarise(n=n()) %>% 
+  mutate(freq=n/sum(n)*100) #frequency by group
+
+saliva %>% group_by(child_race_w1) %>%
+  summarise(n=n()) %>%
+  mutate(freq=n/sum(n)*100) #total frequency
+  
+
+table(saliva$child_latinx_w1,saliva$ELA_group_w1)
+table(saliva$ELA_group_w1[is.na(saliva$child_race_w1)])
+table(saliva$child_race_w1,saliva$child_latinx_w1)
+
+# Sex
+saliva %>% group_by(ELA_group_w1,child_sex_w1) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(child_sex_w1) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+table(saliva$child_race_w1[saliva$child_latinx_w1==0],saliva$child_sex_w1[saliva$child_latinx_w1==0],useNA = "ifany")
+table(saliva$child_race_w1[saliva$child_latinx_w1==1],saliva$child_sex_w1[saliva$child_latinx_w1==1],useNA = "ifany")
+table(saliva$child_race_w1[is.na(saliva$child_latinx_w1)],saliva$child_sex_w1[is.na(saliva$child_latinx_w1)],useNA = "ifany")
+
+# Oral Hygiene
+saliva[!is.na(saliva$brush_w2),] %>%
+  group_by(ELA_group_w1, brush_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva[!is.na(saliva$brush_w2),] %>%
+   group_by(brush_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva$floss_brief_w2 <- ifelse(
+  saliva$floss_w2=='Once a day'|
+    saliva$floss_w2=='2 or more times a day',
+  'Once or more a day',ifelse(!is.na(
+    saliva$floss_w2),'Less than once a day',
+    NA))
+
+saliva[!is.na(saliva$floss_brief_w2),] %>%
+   group_by(ELA_group_w1, floss_brief_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva[!is.na(saliva$floss_brief_w2),] %>%
+   group_by(floss_brief_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva[!is.na(saliva$oral_health_binary_w2),] %>%
+   group_by(ELA_group_w1,oral_health_binary_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva[!is.na(saliva$oral_health_binary_w2),] %>%
+   group_by(oral_health_binary_w2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+
+# Education
+saliva %>% group_by(ELA_group_w1, highest_cg_education2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(highest_cg_education2) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+
+saliva %>% group_by(ELA_group_w1) %>% summarise_at(vars(c(WHtR,child_age_years_w1, covid_impact_w1)),list(mean=mean, sd=sd))
+
+# Siblings
+saliva %>% group_by(ELA_group_w1, has_sib) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(has_sib) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+# Birth Method
+saliva %>% group_by(ELA_group_w1, c_section_w1) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(c_section_w1) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+# Breastfeeding
+saliva %>% group_by(ELA_group_w1,breastfeeding) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(breastfeeding) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+# Antibiotics
+saliva %>% group_by(ELA_group_w1, antibiotics) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+
+saliva %>% group_by(antibiotics) %>%
+  summarise(n=n()) %>% mutate(freq=n/sum(n)*100)
+```
+
+# Cortisol , Health, and Oral Health by CA Group
+
+```{r}
+# CBCL Somatic Complaints
+t.test(log(ifelse(saliva$somatic_complaints==0, 0.5, #0.5 is half the minimum value
+                  saliva$somatic_complaints))~saliva$Adversity, method='welch')
+
+# CBCL Internalizing Symptoms
+t.test(log(ifelse(saliva$internalizing_w1==0, min(saliva$internalizing_w1)/2,
+                  saliva$internalizing_w1))~saliva$Adversity,method='welch')
+
+# PEDS-QL Fatigue
+t.test(sqrt(saliva$pedsql_f)~saliva$Adversity,method='welch')
+
+# Cortisol 
+t.test(saliva$logcort~saliva$Adversity,method='welch')
+
+# Oral Hygeine
+t.test(saliva$oral_hygeine_w2 ~ saliva$Adversity,method='welch')
+
+# Oral Health Symptoms
+chisq.test(saliva$oral_health_binary_w2, saliva$Adversity)
+
+# Cortisol by caregiver education
+get_regression_table(lm(logcort ~ ed1 + ed2,data=saliva)) %>%
+  kableExtra::kable()
+```
+
+#### Figures
+
+Set color scheme for figures:
+
+```{r}
+adversity_colors=c('Comparison'="#8DA0CB",'Caregiving Adversity'="#FC8D62",
+                   'Above Mean'='#66C2A5',
+                   'Below Mean'='#A6D854',
+                   'less_than_bachelors'="#6BAED6",
+                   'bachelors_degree' = "#3182BD",
+                   'graduate_degree' = "#08519C"
+                   
+                   )
+saliva$cort_dummy <- as.factor(ifelse(saliva$logcort<mean(saliva$logcort,na.rm=TRUE),
+                            'Below Mean', 'Above Mean')) %>%
+  relevel(.,ref='Below Mean')
+
+```
+
+
+
+Plot CA group differences in health outcomes and cortisol, and
+cortisol by caregiver education.
+```{r}
+
+# CBCL Somatic
+A <- ggplot(saliva,aes(y=somatic_complaints,x=Adversity)) +
+  geom_violin(aes(color=Adversity)) +
+  geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+  theme_bw() + labs(y="CBCL - Somatic Complaints") +
+  stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+  scale_color_manual(values=adversity_colors) +
+  theme(legend.position='bottom', text=element_text(size=12,color='black'),
+        #axis.text.x=element_text(size=14,color='black'),
+        plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+        axis.title.y=element_text(size=12)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+
+# CBCL Internalizing
+B <- ggplot(saliva,aes(y=internalizing_w1,x=Adversity)) +
+  geom_violin(aes(color=Adversity)) +
+  geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+  theme_bw() + labs(y="CBCL - Internalizing Symptoms") +
+  stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+  scale_color_manual(values=adversity_colors) +
+  theme(legend.position='bottom', text=element_text(size=12,color='black'),
+        #axis.text.x=element_text(size=14,color='black'),
+        plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+        axis.title.y=element_text(size=12)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+
+# PEDS-QL Fatigue
+C <- ggplot(saliva,aes(y=pedsql_f,x=Adversity)) +
+  geom_violin(aes(color=Adversity)) +
+  geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+  theme_bw() + labs(y="PEDS-QL - Fatigue") +
+  stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+  scale_color_manual(values=adversity_colors) +
+  theme(legend.position='bottom', text=element_text(size=12,color='black'),
+        #axis.text.x=element_text(size=14,color='black'),
+        plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+        axis.title.y=element_text(size=12)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+
+
+# Hair Cortisol
+D <- ggplot(saliva,aes(y=logcort,x=Adversity)) +
+  geom_violin(aes(color=Adversity)) +
+  geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+  theme_bw() + labs(y="Hair Cortisol (log pg/mg)") +
+  stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+  scale_color_manual(values=adversity_colors) +
+  theme(legend.position='bottom', text=element_text(size=12,color='black'),
+        #axis.text.x=element_text(size=14,color='black'),
+        plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+        axis.title.y=element_text(size=12)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+
+
+
+# Panel
+abundance_panel <- ggarrange(A,B,C,D,
+                             labels= c("A","B","C","D"),
+                             ncol=2, nrow=2,
+                             common.legend=T,
+                             legend="bottom")
+
+abundance_panel
+ggsave("figures/paper/group_difs_panel.png",width=8,height=10)
+
+# Cortisol ~ CG Ed
+ggplot(saliva[!is.na(saliva$highest_cg_education2),]
+            ,aes(y=logcort,x=highest_cg_education2,
+                       color=highest_cg_education2)) +
+  geom_violin(aes(color=highest_cg_education2)) +
+  geom_point(aes(color=highest_cg_education2),
+             position=position_jitter(width=0.08),size=1)+
+  theme_bw() + labs(y="Hair Cortisol (log pg/mg)",
+                    x="Highest Caregiver Education") +
+  stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+  scale_color_manual(values=adversity_colors) +
+  scale_x_discrete(labels=c("Less than\nBachelor's",
+                            "Bachelor's\nDegree",
+                            "Graduate\nDegree")) +
+  theme(legend.position='none', text=element_text(size=12,color='black'),
+        #axis.text.x=element_text(size=14,color='black'),
+        plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+        axis.title.y=element_text(size=12)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+ggsave("figures/paper/cort_by_ed.png",width=4,height=5)
+
+```
+
+# Aim 1: Adversity x Cortisol
+
+## Alpha
+
+### Faith PD
+
+```{r}
+#assumptions
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort, data=saliva)
+faith_pd_resids <- resid(faith_pd_model)
+faith_pd_fitted <- fitted(faith_pd_model)
+##normality of residuals
+hist(faith_pd_resids)
+##heteroskedasticity + linearity
+plot(faith_pd_resids ~ faith_pd_fitted)
+
+#standard summary
+get_regression_table(faith_pd_model)  %>% kableExtra::kable()
+
+```
+
+
+#### Faith PD Probed
+Probing the slope of cortisol within the Comparison
+group.
+
+```{r}
+#Relevel adversity
+saliva$ELAref <- relevel(saliva$Adversity,ref='Caregiving Adversity')
+faith_pd_model2 <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       ELAref*logcort, data=saliva)
+get_regression_table(faith_pd_model2)  %>% kableExtra::kable()
+
+#Johnson-Neyman probe
+faith_pd_model3 <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       ELA_group_w1*logcort, data=saliva)
+sim_slopes(faith_pd_model3,pred=ELA_group_w1,modx=logcort)
+```
+
+
+#### Effect Size
+Calculate effect size.
+
+```{r}
+faith_pd_effect_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort, data=saliva)
+summ(faith_pd_effect_model, part.corr=TRUE, digits=2)
+```
+
+### Observed Features
+
+```{r}
+#assumptions
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva)
+observed_features_resids <- resid(observed_features_model)
+observed_features_fitted <- fitted(observed_features_model)
+##normality of residuals
+hist(observed_features_resids)
+##heteroskedasticity + linearity
+plot(observed_features_resids ~ observed_features_fitted)
+
+#standard summary
+get_regression_table(observed_features_model)  %>% kableExtra::kable()
+```
+
+#### Observed Features Probed
+
+```{r}
+observed_features_model2 <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                       ELAref*logcort, data=saliva)
+get_regression_table(observed_features_model2)  %>% kableExtra::kable()
+```
+
+#### Effect Size
+
+```{r}
+observed_features_effect_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort, data=saliva)
+summ(observed_features_effect_model, part.corr=TRUE, digits=2)
+```
+
+### Pielou Evenness
+
+```{r}
+#assumptions
+pielou_evenness_model <- lm(pielou_evenness ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva)
+pielou_evenness_resids <- resid(pielou_evenness_model)
+pielou_evenness_fitted <- fitted(pielou_evenness_model)
+##normality of residuals
+hist(pielou_evenness_resids)
+##heteroskedasticity + linearity
+plot(pielou_evenness_resids ~ pielou_evenness_fitted)
+
+#standard summary
+get_regression_table(pielou_evenness_model)  %>% kableExtra::kable()
+```
+
+### Shannon Entropy
+
+```{r}
+#assumptions
+shannon_entropy_model <- lm(shannon_entropy ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva)
+shannon_entropy_resids <- resid(shannon_entropy_model)
+shannon_entropy_fitted <- fitted(shannon_entropy_model)
+##normality of residuals
+hist(shannon_entropy_resids)
+##heteroskedasticity + linearity
+plot(shannon_entropy_resids ~ shannon_entropy_fitted)
+
+#standard summary
+get_regression_table(shannon_entropy_model)  %>% kableExtra::kable()
+```
+
+### Figures
+Commented out to make the code run faster.
+
+```{r}
+#Faith by cort*adversity
+pa <- ggplot(saliva,aes(x=logcort,y=faith_pd)) +
+  geom_point(aes(color=Adversity),size=4)+
+  geom_smooth(method=lm,aes(color=Adversity),se=FALSE) +
+  theme_bw() + labs(y="Faith's Phylogenetic Diversity", x='Hair Cortisol (log pg/mg)') + scale_color_manual(values=adversity_colors) +
+  facet_wrap(~Adversity) +
+  theme(legend.position='bottom', text=element_text(size=30,color='black'),
+        plot.title=element_text(hjust=0.5), legend.title=element_blank(),
+        legend.text=element_text(size=27))
+ggsave("figures/paper/cort_adversity_faithpd.png",width=15,height=10)
+
+#Observed features by cort*adversity
+pb <- ggplot(saliva,aes(x=logcort,y=observed_features)) +
+  geom_point(aes(color=Adversity),size=4)+
+  geom_smooth(method=lm,se=FALSE,color="black") +
+  theme_bw() + labs(y="Observed Feature Counts", x='Hair Cortisol (log pg/mg)') +
+  scale_color_manual(values=adversity_colors) +
+  #facet_wrap(~Adversity) +
+  theme(legend.position='bottom', text=element_text(size=30,color='black'),
+        plot.title=element_text(hjust=0.5), legend.title=element_blank(),
+        legend.text=element_text(size=27))
+ggsave("figures/paper/cort_adversity_observed.png",width=15,height=10)
+
+
+# panel
+cort_CA_panel <- ggarrange(pa, pb,
+                             labels= c("A","B"),
+                             ncol=1, nrow=2,
+                             common.legend=T,
+                             legend="bottom",
+                           font.label=list(size=24))
+
+#cort_CA_panel
+ggsave("figures/paper/cort_CA_panel.png",width=15,height=18)
+
+# #Pielou evenness by cort*adversity
+# ggplot(saliva,aes(x=logcort,y=pielou_evenness)) +
+#   geom_point(aes(color=Adversity),size=4)+
+#   geom_smooth(method=lm,aes(color=Adversity),se=FALSE) +
+#   theme_bw() + labs(y="Pielou's Evenness", x='Hair Cortisol (log pg/mg)') +
+#   scale_color_manual(values=adversity_colors) +
+#   facet_wrap(~Adversity) +
+#   theme(legend.position='bottom', text=element_text(size=30,color='black'),
+#         plot.title=element_text(hjust=0.5), legend.title=element_blank(),
+#         legend.text=element_text(size=27))
+# ggsave("figures/paper/cort_adversity_pielou.png",width=15,height=10)
+# 
+# 
+# #Shannon Entropy by cort*adversity
+# ggplot(saliva,aes(x=logcort,y=shannon_entropy)) +
+#   geom_point(aes(color=Adversity),size=4)+
+#   geom_smooth(method=lm,aes(color=Adversity),se=FALSE) +
+#   theme_bw() + labs(y="Shannon's Entropy", x='Hair Cortisol (log pg/mg)') +
+#   scale_color_manual(values=adversity_colors) +
+#   facet_wrap(~Adversity) +
+#   theme(legend.position='bottom', text=element_text(size=30,color='black'),
+#         plot.title=element_text(hjust=0.5), legend.title=element_blank(),
+#         legend.text=element_text(size=27))
+# ggsave("figures/paper/cort_adversity_shannon.png",width=15,height=10)
+```
+
+## Beta
+
+### Sequential testing (see methods)
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+```
+
+### Split Sample
+
+Split the sample to probe the interaction effect.
+
+```{r}
+saliva_CAonly <- saliva[saliva$ELA_group_w1==1,]
+jaccard_CAonly <- jaccard[rownames(jaccard)%in%saliva_CAonly$participant_id,
+                          colnames(jaccard)%in%saliva_CAonly$participant_id]
+rownames(jaccard_CAonly) <- colnames(jaccard_CAonly)
+saliva_componly <- saliva[saliva$ELA_group_w1==0,]
+jaccard_componly <- jaccard[rownames(jaccard)%in%saliva_componly$participant_id,
+                          colnames(jaccard)%in%saliva_componly$participant_id]
+rownames(jaccard_componly) <- colnames(jaccard_componly)
+
+set.seed(5581)
+kable(adonis2(jaccard_CAonly ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       logcort, data=saliva_CAonly, na.action=na.omit, by='term'))
+kable(adonis2(jaccard_componly ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       logcort, data=saliva_componly, na.action=na.omit, by='term'))
+
+```
+
+### Supplement: Marginal
+
+Note: with the 'margin' method, main effects cannot be tested
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='margin'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='margin'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='margin'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='margin'))
+```
+
+
+### Figures
+
+```{r}
+# 
+# #edited in excel
+# jaccard_pcoa <- read.csv("qiime-diversity-results/jaccard_pcoa_results/ec7ac95e-0261-410a-9242-5c801cd811a3/data/jaccard_pcoa.csv")
+# jaccard_pcoa <- merge(jaccard_pcoa,saliva,by.x=colnames(jaccard_pcoa)[1],by.y='participant_id')
+# 
+# pc_d <- ggplot(jaccard_pcoa[!is.na(jaccard_pcoa$logcort),], aes(x=v1,y=v2)) +
+#   stat_ellipse(size=0.5,aes(color=cort_dummy, linetype=cort_dummy)) +
+#   geom_point(size=1.5,aes(color=cort_dummy, shape=cort_dummy))+
+#   scale_linetype_manual(values=c('solid','dashed')) +
+#   scale_shape_manual(values=c(16, 15)) +
+#   facet_grid (cols = vars(Adversity))+
+#   scale_color_manual(values=adversity_colors)+
+#   theme_bw() + labs(y="PC1 (8.45%)",x="PC2 (5.77%)", title="Jaccard Dissimilarity",
+#                     shape='Hair Cortisol (log pg/mg)', color='Hair Cortisol (log pg/mg)',
+#                     linetype = 'Hair Cortisol (log pg/mg)') +
+#   theme(text=element_text(size=10),plot.title=element_text(hjust=0.5),
+#         legend.text=element_text(size=10),legend.position = 'bottom') +
+#   guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/pcoa_jaccard_adversity.png",width=10,height=7)
+# 
+# 
+# bc_pcoa <- read.csv("qiime-diversity-results/bray_curtis_pcoa_results/bray_curtis_pcoa_results/4126841d-6b70-4659-8cfb-90c5e98ad148/data/bc_pcoa.csv")
+# bc_pcoa <- merge(bc_pcoa, saliva, by.x=colnames(bc_pcoa)[1],by.y='participant_id')
+# 
+# pc_c <- ggplot(bc_pcoa[!is.na(jaccard_pcoa$logcort),], aes(x=v1,y=v2)) +
+#   stat_ellipse(size=0.5, aes(color=Adversity)) +
+#   geom_point(size=1.5,aes(color=Adversity, shape=cort_dummy))+
+#   scale_shape_manual(values=c(16, 15)) +
+#   scale_color_manual(values=adversity_colors)+
+#   theme_bw() + labs(y="PC1 (19.62%)",x="PC2 (9.62%)", title="Bray-Curtis Dissimilarity",
+#                     shape='Hair Cortisol (log pg/mg)') +
+#   theme(text=element_text(size=10),plot.title=element_text(hjust=0.5),
+#         legend.text=element_text(size=10),legend.position = 'bottom') +
+#   scale_x_continuous(breaks=c(-0.3,0.0,0.3))+
+#   guides(color=guide_legend(title.position='top',title.hjust=0.5),
+#          shape=guide_legend(title.position='top',title.hjust=0.5),linetype=guide_legend(title.position='top',title.hjust=0.5))
+# 
+# # ggsave("figures/paper/pcoa_bc_adversity.png",width=10,height=7)
+# 
+# 
+# uwuf_pcoa <- read.csv("qiime-diversity-results/uwuf_pcoa.csv")
+# uwuf_pcoa <- merge(uwuf_pcoa,saliva, by.x=colnames(uwuf_pcoa)[1],by.y='participant_id')
+# pc_b <- ggplot(uwuf_pcoa[!is.na(jaccard_pcoa$logcort),], aes(x=v1,y=v3,color=logcort))  +
+#   stat_ellipse(size=0.5,aes(color=cort_dummy, linetype=cort_dummy)) +
+#   geom_point(size=1.5,aes(color=cort_dummy, shape=cort_dummy))+
+#   scale_linetype_manual(values=c('solid','dashed')) +
+#   scale_shape_manual(values=c(16, 15)) +
+#   facet_grid (cols = vars(Adversity))+
+#   scale_color_manual(values=adversity_colors)+
+#   theme_bw() + labs(y="PC1 (16.72%)",x="PC3 (6.25%)", title="Unweighted UniFrac Dissimilarity",
+#                     shape='Hair Cortisol (log pg/mg)', color='Hair Cortisol (log pg/mg)',
+#                     linetype = 'Hair Cortisol (log pg/mg)') +
+#   theme(text=element_text(size=10),plot.title=element_text(hjust=0.5),
+#         legend.text=element_text(size=10),legend.position = 'bottom') +
+#   guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/pcoa_uf_adversity.png",width=10,height=7)
+# wuf_pcoa <- read.csv("qiime-diversity-results/wuf_pcoa.csv")
+# wuf_pcoa <- merge(wuf_pcoa,saliva, by.x=colnames(wuf_pcoa)[1],by.y='participant_id')
+# 
+# pc_a <- ggplot(wuf_pcoa[!is.na(jaccard_pcoa$logcort),], aes(x=v1,y=v2,color=logcort)) +
+#   stat_ellipse(size=0.5, aes(color=Adversity)) +
+#   geom_point(size=1.5,aes(color=Adversity, shape=cort_dummy))+
+#   scale_shape_manual(values=c(16, 15)) +
+#   scale_color_manual(values=adversity_colors)+
+#   theme_bw() + labs(y="PC1 (37.85%)",x="PC2 (16.30%)", title="Weighted UniFrac Dissimilarity",
+#                     shape='Hair Cortisol (log pg/mg)') +
+#   theme(text=element_text(size=10),plot.title=element_text(hjust=0.5),
+#         legend.text=element_text(size=10),legend.position = 'bottom') +
+#   guides(color=guide_legend(title.position='top',title.hjust=0.5),
+#          shape=guide_legend(title.position='top',title.hjust=0.5),linetype=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/pcoa_wuf_adversity.png",width=10,height=7)
+# #
+# 
+# pc_e <- ggplot(jaccard_pcoa[!is.na(jaccard_pcoa$logcort),], aes(x=v1,y=v2))+
+#   stat_ellipse(size=0.5, aes(color=Adversity)) +
+#   geom_point(size=1.5,aes(color=Adversity, shape=cort_dummy))+
+#   scale_shape_manual(values=c(16, 15)) +
+#   scale_color_manual(values=adversity_colors)+
+#   theme_bw() + labs(y="PC1 (8.45%)",x="PC2 (5.77%)", title="Jaccard Dissimilarity",
+#                     shape='Hair Cortisol (log pg/mg)') +
+#   theme(text=element_text(size=10),plot.title=element_text(hjust=0.5),
+#         legend.text=element_text(size=10),legend.position = 'bottom') +
+#   guides(color=guide_legend(title.position='top',title.hjust=0.5),
+#          shape=guide_legend(title.position='top',title.hjust=0.5),linetype=guide_legend(title.position='top',title.hjust=0.5))
+# 
+# 
+# pcoa_panel_CA <- ggarrange(pc_c, pc_a, pc_e,
+#                              labels= c("A","B","C"),
+#                         hjust = -0.8,
+#                              ncol=3, nrow=1,
+#                              common.legend=T,
+#                              legend="bottom")
+# 
+# pcoa_panel_CA
+# ggsave("figures/paper/pcoa_panel_CA.png",width=9,height=4)
+# 
+# 
+# pcoa_panel_interaction <- ggarrange(pc_d, pc_b,
+#                              labels= c("D","E"),
+#                         hjust = -0.8,
+#                              ncol=2, nrow=1,
+#                              common.legend=T,
+#                              legend="bottom")
+# 
+# pcoa_panel_interaction
+# ggsave("figures/paper/pcoa_panel_interaction.png",width=9,height=4)
+```
+
+## Differential Abundance
+
+Creating interaction effect variables, as MaAslin cannot currently
+do this using a formula.
+```{r}
+saliva$ELA_logcort <- saliva$ELA_group_w1*saliva$logcort
+saliva_maaslin$logcort_cntr <- scale(saliva_maaslin$logcort)[,1]
+saliva_maaslin$ELA_logcort <-saliva_maaslin$ELA_group_w1*saliva_maaslin$logcort_cntr
+
+saliva_maaslin$ela_subgroup_domestic <- ifelse(saliva$ELA_subgroup=='domestic',
+                                               1,0)
+saliva_maaslin$ela_subgroup_internat <- ifelse(saliva$ELA_subgroup=='internat',
+                                               1,0)
+saliva_maaslin$domestic_logcort <- saliva_maaslin$ela_subgroup_domestic*saliva_maaslin$logcort_cntr
+saliva_maaslin$internat_logcort <- saliva_maaslin$ela_subgroup_internat*saliva_maaslin$logcort_cntr
+```
+
+### Phylum
+
+Note: this code will use Adversity as a categorical variable,
+but some of the supplements reported in the paper use a numeric dummy variable,
+so those coefficients are standardized.
+
+```{r}
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/phylum_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort"))
+
+```
+
+
+### Class
+
+```{r}
+# class_abundance <- Maaslin2(
+#   input_data = class_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/class_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics","covid_impact_w1",
+#                     "Adversity", "logcort_cntr", "ELA_logcort"))
+
+```
+
+
+### Order
+
+```{r}
+# order_abundance <- Maaslin2(
+#   input_data = order_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/order_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics","covid_impact_w1",
+#                     "Adversity", "logcort_cntr", "ELA_logcort"))
+
+```
+
+### Family
+
+```{r}
+# family_abundance <- Maaslin2(
+#   input_data = family_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/family_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics","covid_impact_w1",
+#                     "Adversity", "logcort_cntr", "ELA_logcort"))
+
+```
+
+
+
+### Genus
+
+```{r}
+# genus_abundance <- Maaslin2(
+#   input_data = genus_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/genus_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics","covid_impact_w1",
+#                     "Adversity", "logcort_cntr", "ELA_logcort"))
+
+```
+
+
+
+### ASV
+
+```{r}
+# asv_abundance <- Maaslin2(
+#   input_data = asv_taxonomy,
+#   input_metadata = saliva_maaslin,
+#   normalization = "CLR",
+#   transform = "None",
+#   min_abundance = 1,
+#   min_prevalence = 0.2,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim1/asv_abundance_cort_nm",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics","covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort"))
+
+```
+
+
+
+### Figures
+
+**Data Wrangling**
+
+```{r, show_col_types=FALSE}
+# phylum
+# load adversity- or cortisol-associated taxa
+phylum_aim1_results <- read_tsv("maaslin/aim1/phylum_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace . with ; to match taxonomy files
+phylum_aim1_results$feature <- gsub('\\.',';',phylum_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+phylum_filter <- phylum_taxonomy[, 
+               colSums(phylum_taxonomy>1)>0.2*nrow(phylum_taxonomy),drop=FALSE]
+# center log ratio transform
+phylum_clr <- CLRnorm(phylum_filter)
+# select adversity- or cortisol-associated taxa
+phylum_select <- phylum_clr[,which(colnames(phylum_clr)%in%
+                              phylum_aim1_results$feature)]
+
+# class
+# load adversity- or cortisol-associated taxa
+class_aim1_results <- read_tsv("maaslin/aim1/class_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace . with ; to match taxonomy files
+class_aim1_results$feature <- gsub('\\.',';',class_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+class_filter <- class_taxonomy[, 
+               colSums(class_taxonomy>1)>0.2*nrow(class_taxonomy),drop=FALSE]
+# center log ratio transform
+class_clr <- CLRnorm(class_filter)
+# select adversity- or cortisol-associated taxa
+class_select <- class_clr %>% select(which(colnames(class_clr)%in%
+                              class_aim1_results$feature))
+
+# order
+# load adversity- or cortisol-associated taxa
+order_aim1_results <- read_tsv("maaslin/aim1/order_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace . with ; to match taxonomy files
+order_aim1_results$feature <- gsub('\\.',';',order_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+order_filter <- order_taxonomy[, 
+               colSums(order_taxonomy>1)>0.2*nrow(order_taxonomy),drop=FALSE]
+# center log ratio transform
+order_clr <- CLRnorm(order_filter)
+# select adversity- or cortisol-associated taxa
+order_select <- order_clr %>% select(which(colnames(order_clr)%in%
+                              order_aim1_results$feature))
+
+# family
+# load adversity- or cortisol-associated taxa
+family_aim1_results <- read_tsv("maaslin/aim1/family_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace . with ; to match taxonomy files
+family_aim1_results$feature <- gsub('\\.',';',family_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+family_filter <- family_taxonomy[, 
+               colSums(family_taxonomy>1)>0.2*nrow(family_taxonomy),drop=FALSE]
+# center log ratio transform
+family_clr <- CLRnorm(family_filter)
+# select adversity- or cortisol-associated taxa
+family_select <- family_clr %>% select(which(colnames(family_clr)%in%
+                              family_aim1_results$feature))
+
+
+# genus
+# load adversity- or cortisol-associated taxa
+genus_aim1_results <- read_tsv("maaslin/aim1/genus_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace . with ; to match taxonomy files
+genus_aim1_results$feature <- gsub('\\.',';',genus_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+genus_filter <- genus_taxonomy[, 
+               colSums(genus_taxonomy>1)>0.2*nrow(genus_taxonomy),drop=FALSE]
+# center log ratio transform
+genus_clr <- CLRnorm(genus_filter)
+# select adversity- or cortisol-associated taxa
+genus_select <- genus_clr %>% select(which(colnames(genus_clr)%in%
+                              genus_aim1_results$feature))
+
+# asv
+# load adversity- or cortisol-associated taxa
+asv_aim1_results <- read_tsv("maaslin/aim1/asv_abundance_cort_nm/significant_results.tsv") %>%
+  .[which(.$metadata=='ELA_group_w1'|.$metadata=='logcort_cntr'|.$metadata=='ELA_logcort'),]
+# replace X with '' to match taxonomy files
+asv_aim1_results$feature <- sub('X','',asv_aim1_results$feature)
+# filter the taxonomy file for min prevalence/abundance
+asv_filter <- asv_taxonomy[, 
+               colSums(asv_taxonomy>1)>0.2*nrow(asv_taxonomy),drop=FALSE]
+# center log ratio transform
+asv_clr <- CLRnorm(asv_filter)
+# select adversity- or cortisol-associated taxa
+asv_select <- asv_clr %>% select(which(colnames(asv_clr)%in%
+                              asv_aim1_results$feature))
+
+```
+
+```{r}
+phylum_figure <- merge(saliva,phylum_select,by.x='participant_id',by.y="row.names")
+class_figure <- merge(saliva,class_select,by.x='participant_id',by.y="row.names")
+order_figure <- merge(saliva,order_select,by.x='participant_id',by.y="row.names")
+family_figure <- merge(saliva,family_select,by.x='participant_id',by.y="row.names")
+genus_figure <- merge(saliva,genus_select,by.x='participant_id',by.y="row.names")
+asv_figure <- merge(saliva,asv_select,by.x='participant_id',by.y="row.names")
+
+phylum_summary <- phylum_figure %>% group_by(., Adversity) %>%
+  dplyr::summarise(sd=sd(`d__Bacteria;p__Actinobacteriota`,na.rm=TRUE),
+            mean=mean(`d__Bacteria;p__Actinobacteriota`,na.rm=TRUE),
+            upper = mean+sd,lower = mean-sd)
+
+class_summary <- class_figure %>% group_by(., Adversity) %>%
+  dplyr::summarise(sd=sd(`d__Bacteria;p__Actinobacteriota;c__Actinobacteria`,na.rm=TRUE),
+            mean=mean(`d__Bacteria;p__Actinobacteriota;c__Actinobacteria`,na.rm=TRUE))
+
+class_summary <- class_figure %>% group_by(., Adversity) %>%
+  dplyr::summarise(sd=sd(`d__Bacteria;p__Actinobacteriota;c__Actinobacteria`,na.rm=TRUE),
+            mean=mean(`d__Bacteria;p__Actinobacteriota;c__Actinobacteria`,na.rm=TRUE))
+```
+
+
+#### Create Figures
+```{r}
+# #Actinobacteriota - Adversity
+# pa <- ggplot(phylum_figure,aes(x=Adversity,y=`d__Bacteria;p__Actinobacteriota`)) +
+#  geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Actinobacteriota") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#         #axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-actinobacteriota.png",width=7,height=5)
+# 
+# #
+# # #Actinobacteria - Adversity
+# pb <- ggplot(class_figure,aes(x=Adversity,y=`d__Bacteria;p__Actinobacteriota;c__Actinobacteria`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Actinobacteria") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#         #axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-actinobacteria.png",width=7,height=5)
+# #
+# # #Actinomycetales - Adversity
+# pc <- ggplot(order_figure,aes(x=Adversity,y=`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Actinomycetales") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-actinomycetales.png",width=7,height=5)
+# #
+# # #Actinomycetaceae - Adversity
+# pd <- ggplot(family_figure,aes(x=Adversity,y=`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales;f__Actinomycetaceae`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Actinomycetaceae")  +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#         #axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-actinomycetaceae.png",width=7,height=5)
+# #
+# # #Leptotrichiaceae - Adversity
+# pe <- ggplot(family_figure,aes(x=Adversity,y=`d__Bacteria;p__Fusobacteriota;c__Fusobacteriia;o__Fusobacteriales;f__Leptotrichiaceae`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Leptotrichiaceae") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-leptotrichiaceae.png",width=7,height=5)
+# #
+# # #Actinomyces - Adversity
+# pf <- ggplot(genus_figure,aes(x=Adversity,y=`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales;f__Actinomycetaceae;g__Actinomyces`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Actinomyces") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-actinomyces.png",width=7,height=5)
+# #
+# # #Leptotrichia - Adversity
+# pg <- ggplot(genus_figure,aes(x=Adversity,y=`d__Bacteria;p__Fusobacteriota;c__Fusobacteriia;o__Fusobacteriales;f__Leptotrichiaceae;g__Leptotrichia`)) +
+#  geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Leptotrichia") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/adversity-leptotrichia.png",width=7,height=5)
+# #
+# #Rothia Adversity
+# ph <- ggplot(asv_figure,aes(x=Adversity,y=`0752ecd68d5223cdb88af890fe58aa5b`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Rothia Mucilaginosa") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# #ggsave("figures/paper/adversity-rothia-mucilaginosa.png",width=7,height=5)
+# #
+# #Porphyromonas- Adversity
+# pi <- ggplot(asv_figure,aes(x=Adversity,y=`15863307c9fc808f78fdeb4e8bbca58a`)) +
+#   geom_violin(aes(color=Adversity)) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Porphyromonas\n(uncultured species)") +
+#   stat_summary(fun="mean",geom="crossbar",color="black",width=0.2, size=.25) +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#       #  axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),axis.title.x=element_blank(),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# #ggsave("figures/paper/adversity-porphyromonas-uncultured.png",width=7,height=5)
+# #
+# # #Fusobacteriota - Cortisol
+# pj <- ggplot(phylum_figure,aes(x=logcort,y=`d__Bacteria;p__Fusobacteriota`)) +
+#   geom_smooth(alpha=0,method='lm',color='black',size=1) +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.08),size=1)+
+#   theme_bw() + labs(y="Fusobacteriota",x="Hair Cortisol (log pg/mg)") +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=12,color='black'),
+#        # axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),
+#         axis.title.y=element_text(size=10)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# # ggsave("figures/paper/cortisol-fusobacteriota.png",width=7,height=5)
+# 
+# 
+# # panel
+# abundance_panel <- ggarrange(pa, pb, pc, pd, pe, pf, pg, ph, pi, pj,
+#                              labels= c("A","B","C","D","E","F",
+#                                        "G","H","I","J"),
+#                              ncol=2, nrow=5,
+#                              common.legend=T,
+#                              legend="bottom")
+# 
+# abundance_panel
+# ggsave("figures/paper/abundance_panel.png",width=8,height=10)
+```
+
+### Effect Sizes
+
+Note: we use the raw ELA coefficients here in reporting, as a substitute to
+some of the Maaslin coefficients which have standardized ELA
+
+```{r}
+## PHYLUM - Actinobacteriota ##
+actinobacteriota_effect_model <- lm(phylum_select$`d__Bacteria;p__Actinobacteriota` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(actinobacteriota_effect_model, part.corr=TRUE, digits=2)
+
+## PHYLUM - Fusobacteriota ##
+fusobacteriota_effect_model <- lm(phylum_select$`d__Bacteria;p__Fusobacteriota` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(fusobacteriota_effect_model, part.corr=TRUE, digits=2)
+
+## CLASS - Actinobacteria ##
+actinobacteria_effect_model <- 
+  lm(class_select$`d__Bacteria;p__Actinobacteriota;c__Actinobacteria` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(actinobacteria_effect_model, part.corr=TRUE, digits=2)
+
+## ORDER - Actinomycetales ##
+actinomycetales_effect_model <- 
+  lm(order_select$`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(actinomycetales_effect_model, part.corr=TRUE, digits=2)
+
+## FAMILY - Actinomycetaceae ##
+actinomycetaceae_effect_model <- 
+  lm(family_select$`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales;f__Actinomycetaceae` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(actinomycetaceae_effect_model, part.corr=TRUE, digits=2)
+
+## FAMILY - Leptotrichiae ##
+leptotrichiae_effect_model <- 
+  lm(family_select$`d__Bacteria;p__Fusobacteriota;c__Fusobacteriia;o__Fusobacteriales;f__Leptotrichiaceae` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(leptotrichiae_effect_model, part.corr=TRUE, digits=2)
+
+## GENUS - Actinomyces ##
+actinomyces_effect_model <- 
+  lm(genus_select$`d__Bacteria;p__Actinobacteriota;c__Actinobacteria;o__Actinomycetales;f__Actinomycetaceae;g__Actinomyces` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(actinomyces_effect_model, part.corr=TRUE, digits=2)
+
+
+## GENUS - Leptotrichia ##
+leptotrichia_effect_model <- 
+  lm(genus_select$`d__Bacteria;p__Fusobacteriota;c__Fusobacteriia;o__Fusobacteriales;f__Leptotrichiaceae;g__Leptotrichia` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(leptotrichia_effect_model, part.corr=TRUE, digits=2)
+
+## ASV - R. Mucilaginosa ##
+mucilaginosa_effect_model <- 
+  lm(asv_select$`0752ecd68d5223cdb88af890fe58aa5b` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(mucilaginosa_effect_model, part.corr=TRUE, digits=2)
+
+## ASV - Porphyromonas sp ##
+porphyromonas_effect_model <- 
+  lm(asv_select$`15863307c9fc808f78fdeb4e8bbca58a` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(porphyromonas_effect_model, part.corr=TRUE, digits=2)
+```
+
+# Aim 2: Health
+
+We select features identified above as associated with adversity or
+cortisol, and we test these features for association with 3 health
+outcomes of interest: internalizing, somatic complaints, and fatigue.
+
+## Alpha
+
+### Faith PD
+
+Somatic
+
+```{r}
+#assumptions
+faith_pd_model <- lm(faith_pd ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       somatic_complaints, data=saliva)
+faith_pd_resids <- resid(faith_pd_model)
+faith_pd_fitted <- fitted(faith_pd_model)
+##normality of residuals
+hist(faith_pd_resids)
+##heteroskedasticity + linearity
+plot(faith_pd_resids ~ faith_pd_fitted)
+
+#standard summary
+get_regression_table(faith_pd_model)  %>% kableExtra::kable()
+```
+
+Internalizing
+
+```{r}
+#assumptions
+faith_pd_model <- lm(faith_pd ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       internalizing_w1, data=saliva)
+faith_pd_resids <- resid(faith_pd_model)
+faith_pd_fitted <- fitted(faith_pd_model)
+##normality of residuals
+hist(faith_pd_resids)
+##heteroskedasticity + linearity
+plot(faith_pd_resids ~ faith_pd_fitted)
+
+#standard summary
+get_regression_table(faith_pd_model)  %>% kableExtra::kable()
+```
+
+Fatigue
+
+```{r}
+#assumptions
+faith_pd_model <- lm(faith_pd ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       pedsql_f, data=saliva)
+faith_pd_resids <- resid(faith_pd_model)
+faith_pd_fitted <- fitted(faith_pd_model)
+##normality of residuals
+hist(faith_pd_resids)
+##heteroskedasticity + linearity
+plot(faith_pd_resids ~ faith_pd_fitted)
+
+#standard summary
+get_regression_table(faith_pd_model)  %>% kableExtra::kable()
+```
+
+### Observed Features
+
+Somatic
+
+```{r}
+#assumptions
+observed_features_model <- lm(observed_features ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       somatic_complaints, data=saliva)
+observed_features_resids <- resid(observed_features_model)
+observed_features_fitted <- fitted(observed_features_model)
+##normality of residuals
+hist(observed_features_resids)
+##heteroskedasticity + linearity
+plot(observed_features_resids ~ observed_features_fitted)
+
+#standard summary
+get_regression_table(observed_features_model)  %>% kableExtra::kable()
+```
+
+Internalizing
+
+```{r}
+#assumptions
+observed_features_model <- lm(observed_features ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       internalizing_w1, data=saliva)
+observed_features_resids <- resid(observed_features_model)
+observed_features_fitted <- fitted(observed_features_model)
+##normality of residuals
+hist(observed_features_resids)
+##heteroskedasticity + linearity
+plot(observed_features_resids ~ observed_features_fitted)
+
+#standard summary
+get_regression_table(observed_features_model)  %>% kableExtra::kable()
+```
+
+Fatigue
+
+```{r}
+#assumptions
+observed_features_model <- lm(observed_features ~ Adversity*logcort + child_age_years_w1 +
+                       child_sex_w1 + breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       pedsql_f, data=saliva)
+observed_features_resids <- resid(observed_features_model)
+observed_features_fitted <- fitted(observed_features_model)
+##normality of residuals
+hist(observed_features_resids)
+##heteroskedasticity + linearity
+plot(observed_features_resids ~ observed_features_fitted)
+
+#standard summary
+get_regression_table(observed_features_model)  %>% kableExtra::kable()
+```
+
+Conclusion: no alpha diversity relationship with any of the 3 health
+outcomes
+
+## Beta
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + pedsql_f, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + somatic_complaints, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + internalizing_w1, data=saliva, na.action=na.omit, by='term'))
+
+
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + pedsql_f, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + somatic_complaints, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + internalizing_w1, data=saliva, na.action=na.omit, by='term'))
+
+
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                       Adversity*logcort + pedsql_f, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                       Adversity*logcort + somatic_complaints, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                       Adversity*logcort + internalizing_w1, data=saliva, na.action=na.omit, by='term'))
+
+
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + pedsql_f, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + somatic_complaints, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       Adversity*logcort + internalizing_w1, data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+## Differential Abundance
+
+### Phylum
+
+```{r}
+# #internalizing
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/phylum_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/phylum_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/phylum_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+
+
+
+```
+
+
+
+### Class
+
+```{r}
+# #internalizing
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/class_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/class_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/class_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+
+
+
+```
+
+
+
+### Order
+
+```{r}
+# #internalizing
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/order_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/order_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/order_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+# 
+# 
+
+```
+
+
+
+### Family
+
+```{r}
+# #internalizing
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/family_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/family_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/family_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+
+
+```
+
+
+
+### Genus
+
+```{r}
+
+# #internalizing
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/genus_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/genus_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/genus_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+
+
+```
+
+
+
+### ASV
+
+```{r}
+# #internalizing
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/asv_abundance_internalizing",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1"))
+# 
+# #somatic complaints
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/asv_abundance_somatic",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "somatic_complaints"))
+# 
+# #fatigue
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/aim2/asv_abundance_fatigue",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "pedsql_f"))
+
+
+
+```
+
+
+
+### Figures
+
+```{r}
+# #Porphyromonas- Internalizing
+# ggplot(asv_figure,aes(x=internalizing_w1,y=`15863307c9fc808f78fdeb4e8bbca58a`)) +
+#   geom_smooth(method="lm",alpha=0,color='black') +
+#   geom_point(aes(color=Adversity),position=position_jitter(width=0.15),size=2)+
+#   theme_bw() + labs(y="Porphyromonas (uncultured\nspecies; CLR)", x="Child Behavior Checklist - Internalizing Symptoms") +
+#   scale_color_manual(values=adversity_colors) +
+#   theme(legend.position='bottom', text=element_text(size=14,color='black'),
+#         axis.text.x=element_text(size=14,color='black'),
+#         plot.title=element_text(hjust=0.5),
+#         axis.title.y=element_text(size=16)) + guides(color=guide_legend(title.position='top',title.hjust=0.5))
+# ggsave("figures/paper/internalizing-porphyromonas-uncultured.png",width=7,height=5)
+```
+
+### Effect Size
+
+```{r}
+## ASV - Porphyromonas sp ##
+porphyromonas_effect_model <- 
+  lm(asv_select$`15863307c9fc808f78fdeb4e8bbca58a` ~
+                                      child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 + internalizing_w1 +
+                       antibiotics + covid_impact_w1 + 
+                      ELA_group_w1*logcort_cntr, data=saliva_maaslin)
+summ(porphyromonas_effect_model, part.corr=TRUE, digits=2)
+```
+
+# Robustness Analyses
+
+Note: I decided not to adjust for hair storage time because it is correlated
+with ELA group.
+
+## Aim 1
+
+### Alpha
+
+#### Saliva Storage
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + saliva_storage_time, data=saliva)
+get_regression_table(faith_pd_model)  %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + saliva_storage_time, data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+
+
+#### Saliva Incubation
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + saliva_incubated, data=saliva)
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + saliva_incubated, data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+
+
+#### Hair Temperature
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + hair_storage_temperature, data=saliva)
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + hair_storage_temperature, data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+
+#### CA Subgroups
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       ELA_subgroup*logcort, data=saliva)
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       ELA_subgroup*logcort , data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+
+#### Oral Hygeine
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + oral_hygeine_w2, data=saliva)
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + oral_hygeine_w2, data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+
+
+#### Online/in-Person
+
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + wave_1_online, data=saliva)
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       Adversity*logcort + wave_1_online, data=saliva)
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+#### Stable Care
+```{r}
+# faith pd
+faith_pd_model <- lm(faith_pd ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                      logcort + time_since_ca, data=saliva[saliva$ELA_group_w1==1,])
+get_regression_table(faith_pd_model) %>% kableExtra::kable()
+
+# observed features
+observed_features_model <- lm(observed_features ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 +
+                       logcort + time_since_ca, data=saliva[saliva$ELA_group_w1==1,])
+get_regression_table(observed_features_model) %>% kableExtra::kable()
+```
+
+### Beta
+
+#### Saliva Storage
+
+```{r}
+set.seed(5581)
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                saliva_storage_time +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_storage_time +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_storage_time +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_storage_time +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+#### Saliva Incubation
+
+```{r}
+set.seed(5581)
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                saliva_incubated +
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_incubated +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_incubated +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                saliva_incubated +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+#### Hair Temperature
+
+```{r}
+set.seed(5581)
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                hair_storage_temperature +
+                       Adversity*logcort,  data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                hair_storage_temperature +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+#### CA Subgroups
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       ELA_subgroup*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                       ELA_subgroup*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                      ELA_subgroup*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                      ELA_subgroup*logcort, data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+#### Oral Hygeine
+
+```{r}
+set.seed(5581)
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                oral_hygeine_w2+ 
+                       Adversity*logcort, data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 +
+                oral_hygeine_w2 +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+```
+
+
+
+#### Online/in-Person
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                wave_1_online +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(jaccard ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                wave_1_online +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                wave_1_online +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                wave_1_online +
+                       Adversity*logcort , data=saliva, na.action=na.omit, by='term'))
+```
+
+#### Stable Care
+*Data wrangling*
+``` {r}
+bray_curtis_ca <- bray_curtis[rownames(bray_curtis)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1],
+                              colnames(bray_curtis)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1]]
+rownames(bray_curtis_ca) <- colnames(bray_curtis_ca)
+
+jaccard_ca <- jaccard[rownames(jaccard)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1],
+                              colnames(jaccard)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1]]
+rownames(jaccard_ca) <- colnames(jaccard_ca)
+
+unweighted_uf_ca <- unweighted_uf[rownames(unweighted_uf)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1],
+                              colnames(unweighted_uf)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1]]
+rownames(unweighted_uf_ca) <- colnames(unweighted_uf_ca)
+
+weighted_uf_ca <- weighted_uf[rownames(weighted_uf)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1],
+                              colnames(weighted_uf)%in%
+                                saliva$participant_id[
+                                  saliva$ELA_group_w1==1]]
+rownames(weighted_uf_ca) <- colnames(weighted_uf_ca)
+```
+
+```{r}
+set.seed(5581)
+kable(adonis2(bray_curtis_ca ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                time_since_ca +
+                       logcort , data=saliva_CAonly, na.action=na.omit, by='term'))
+kable(adonis2(jaccard_ca ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1 + 
+                time_since_ca +
+                       logcort , data=saliva_CAonly, na.action=na.omit, by='term'))
+kable(adonis2(unweighted_uf_ca ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics + covid_impact_w1 + 
+                time_since_ca +
+                       logcort , data=saliva_CAonly, na.action=na.omit, by='term'))
+kable(adonis2(weighted_uf_ca ~ child_age_years_w1 + child_sex_w1 + 
+                       breastfeeding + c_section_w1 +
+                       antibiotics  + covid_impact_w1+ 
+                time_since_ca +
+                       logcort , data=saliva_CAonly, na.action=na.omit, by='term'))
+```
+
+### Abundance
+
+#### Phylum
+
+```{r}
+# #saliva_storage_time
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_saliva_storage",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# #hair storage temperature
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+
+# #CA Subgroups
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: robust to domestic and int
+
+# fusobacteriota <- phylum_select %>% select(`d__Bacteria;p__Fusobacteriota`)
+# 
+# #oral hygeine
+# phylum_abundance <- Maaslin2(
+#   input_data = fusobacteriota,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_oral_hygeine",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "oral_hygeine_w2"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: cort effect remains sig positive
+
+# #Online/in-Person
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: effects remain sig
+
+# #Time in stable care
+# phylum_abundance <- Maaslin2(
+#   input_data = phylum_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/phylum_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: only cort significant, not stable care
+
+```
+
+
+#### Class
+
+```{r}
+# #saliva_storage_time
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_saliva_storage_time",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# 
+# 
+# #hair_storage_temperature
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+
+
+# #CA Subgroups
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: robust to domestic and int
+
+# #Online/in-Person
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: cort effect remains sig positive
+
+# #Time in stable care
+# class_abundance <- Maaslin2(
+#   input_data = class_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/class_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: no significant stable care or cort effects
+
+```
+
+
+
+#### Order
+
+```{r}
+# #saliva_storage_time
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_saliva_storage_time",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# 
+# 
+# #hair_storage_temperature
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+# #CA Subgroups
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: robust to domestic and int plus a sig cort*domestic term
+
+
+# #Online/in-Person
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: effect remains sig negative
+
+# #Time in stable care
+# order_abundance <- Maaslin2(
+#   input_data = order_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/order_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: no significant stable care or cort effects
+```
+
+
+
+#### Family
+
+```{r}
+# #saliva_storage_time
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_saliva_storage_time",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# 
+# 
+# #hair_storage_temperature
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+# #CA Subgroups
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: robust to domestic and int
+
+
+# #Online/in-Person
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: effects remain
+
+# #Time in stable care
+# family_abundance <- Maaslin2(
+#   input_data = family_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/family_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: no significant stable care or cort effects
+```
+
+
+
+#### Genus
+
+```{r}
+
+# #saliva_storage_time
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_saliva_storage_time",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# 
+# #hair_storage_temperature
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+# #CA Subgroups
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: marginally nonsig but same direction
+
+
+# #Online/in-Person
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: effects remain sig
+
+# #Time in stable care
+# genus_abundance <- Maaslin2(
+#   input_data = genus_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/genus_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: no significant stable care or cort effects
+```
+
+
+
+#### ASV
+
+```{r}
+# #saliva_storage_time
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_saliva_storage_time",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_storage_time"))
+# 
+# #saliva_incubated complaints
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "saliva_incubated"))
+# 
+# #hair_storage_temperature
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_hair_storage_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "hair_storage_temperature"))
+
+# #CA Subgroups
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_ca_subgroups",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "ELA_subgroup", "logcort_cntr",
+#                     "domestic_logcort","internat_logcort"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#         "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# #results: effects driven by domestic; int nonsig same direction
+
+# #Online/in-Person
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# results: effects remain sig
+
+# #Time in stable care
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin[saliva_maaslin$ELA_group_w1==1,],
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_stablecare",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "logcort_cntr","time_since_ca"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA"))
+# # results: no significant stable care or cort effects
+```
+
+
+
+## Aim 2
+
+### ASV
+
+```{r}
+# #### Saliva Storage
+# 
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_internalizing_saliva_storage",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1", "saliva_storage_time"))
+# 
+# #### Saliva Incubation
+# 
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_internalizing_saliva_incubated",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1", "saliva_incubated"))
+# 
+# #### Hair Temperature
+# 
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_internalizing_hair_temperature",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "internalizing_w1", "hair_storage_temperature"))
+
+# #Online/in-Person
+# asv_abundance <- Maaslin2(
+#   input_data = asv_select,
+#   input_metadata = saliva_maaslin,
+#   normalization = "None",
+#   transform = "None",
+#   min_abundance = 0,
+#   min_prevalence = 0,
+#   correction = "BH", #default
+#   max_significance = 0.25, #default
+#   output = "maaslin/robustness/asv_abundance_internalizing_online_inperson",
+#   fixed_effects = c("child_age_years_w1","child_sex_w1","breastfeeding",
+#                     "c_section_w1","antibiotics", "covid_impact_w1",
+#                     "Adversity", "logcort_cntr","ELA_logcort",
+#                     "wave_1_online","internalizing_w1"),
+#   ref=c("breastfeeding, DK or NA", "c_section_w1, DK or NA",
+#          "antibiotics, DK or NA", "ELA_subgroup, bio"))
+# # results: effect remains
+```
+
+
